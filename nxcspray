@@ -14,8 +14,8 @@
 #   nxcspray smb,ldap,winrm hosts.txt -u bob -H aad3b435b51404eeaad3b435b51404ee:5fbc3d5fec8206a30a0e5adb2efe0ecd
 #   nxcspray rdp 10.0.0.5 -u Administrator -H 5fbc3d5fec8206a30a0e5adb2efe0ecd
 #
-# Each protocol/target is tried twice: once without nxc's --local-auth, then with
-# --local-auth (local account semantics).
+# Each protocol/target is tried without nxc's --local-auth, then again with
+# --local-auth where supported (ldap and ssh omit the second pass).
 
 # ---- Argument Validation ----
 if [ "$#" -lt 4 ]; then
@@ -99,7 +99,9 @@ for PROTO in "${PROTO_ARRAY[@]}"; do
         }
 
         run_nxc
-        echo "    -> (local-auth)"
-        run_nxc --local-auth
+        if [ "$PROTO" != "ldap" ] && [ "$PROTO" != "ssh" ]; then
+            echo "    -> (local-auth)"
+            run_nxc --local-auth
+        fi
     done
 done
